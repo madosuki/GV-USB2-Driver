@@ -254,9 +254,9 @@ static const struct snd_pcm_ops gvusb2_snd_capture_ops = {
 int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 {
 	int ret;
-	int crdIdx;
+	int crdIdx = 0;
 
-	if(crdIdx >= SNDRV_CARDS)
+	if(1 > SNDRV_CARDS)
 		return -ENODEV;
 		
 	if(!enabled[crdIdx]) {
