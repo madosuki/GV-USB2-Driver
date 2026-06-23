@@ -56,6 +56,7 @@ struct gvusb2_snd {
 	bool running;
 	bool disconnected;
 	bool release_on_card_free;
+	bool usb_resources_released;
 	spinlock_t lock;
 };
 
@@ -224,7 +225,7 @@ static int gvusb2_snd_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		spin_lock_irqsave(&dev->lock, flags);
-		if (dev->disconnected) {
+		if (dev->disconnected || dev->usb_resources_released) {
 			spin_unlock_irqrestore(&dev->lock, flags);
 			return -ENODEV;
 		}
@@ -283,8 +284,11 @@ static int gvusb2_snd_dev_free(struct snd_device *device)
 	if (!dev->release_on_card_free)
 		return 0;
 
-	gvusb2_snd_free_isoc(dev);
-	gvusb2_free(&dev->gv);
+	if (!dev->usb_resources_released) {
+		gvusb2_snd_free_isoc(dev);
+		gvusb2_free(&dev->gv);
+		dev->usb_resources_released = true;
+	}
 	kfree(dev);
 
 	return 0;
@@ -324,6 +328,7 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 	dev->running = false;
 	dev->disconnected = false;
 	dev->release_on_card_free = false;
+	dev->usb_resources_released = false;
 
 	ret = snd_card_new(&dev->intf->dev, index[crdIdx], ids[crdIdx], THIS_MODULE, 0,
 			&dev->card);
@@ -373,11 +378,14 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 {
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
+	bool release_usb_resources;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	dev->disconnected = true;
 	dev->running = false;
 	substream = dev->substream;
+	release_usb_resources = !dev->usb_resources_released;
+	dev->usb_resources_released = true;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	snd_card_disconnect(dev->card);
@@ -391,6 +399,10 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 	}
 
 	gvusb2_snd_cancel_isoc(dev);
+	if (release_usb_resources) {
+		gvusb2_snd_free_isoc(dev);
+		gvusb2_free(&dev->gv);
+	}
 	snd_card_free_when_closed(dev->card);
 }
 
@@ -491,7 +503,8 @@ static void gvusb2_snd_isoc_irq(struct urb *urb)
 	gvusb2_snd_process_isoc(dev, urb);
 
 	spin_lock_irqsave(&dev->lock, flags);
-	running = dev->running;
+	running = dev->running && !dev->disconnected &&
+		!dev->usb_resources_released;
 	spin_unlock_irqrestore(&dev->lock, flags);
 	if (!running)
 		return;
@@ -509,6 +522,9 @@ static void gvusb2_snd_isoc_irq(struct urb *urb)
 static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev, gfp_t mem_flags)
 {
 	int i, ret;
+
+	if (dev->disconnected || dev->usb_resources_released)
+		return -ENODEV;
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		ret = usb_submit_urb(dev->urbs[i], mem_flags);
