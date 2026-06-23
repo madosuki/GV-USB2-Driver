@@ -14,6 +14,7 @@
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <linux/vmalloc.h>
+#include <linux/types.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/initval.h>
@@ -52,6 +53,7 @@ struct gvusb2_snd {
 	int dma_offset;
 	int avail;
 	int hw_ptr;
+	bool running;
 	spinlock_t lock;
 };
 
@@ -74,8 +76,9 @@ static struct snd_pcm_hardware gvusb2_snd_hw = {
 };
 
 /* predefines */
-static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev);
+static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev, gfp_t mem_flags);
 static void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev);
+static void gvusb2_snd_unlink_isoc(struct gvusb2_snd *dev);
 
 /*****************************************************************************
  *  Alsa Stuff
@@ -83,23 +86,17 @@ static void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev);
 
 void gvusb2_snd_process_pcm(
 	struct gvusb2_snd *dev,
+	struct snd_pcm_substream *substream,
 	unsigned char *buf,
 	unsigned int len)
 {
 	unsigned long flags;
-	struct snd_pcm_runtime *runtime = dev->substream->runtime;
+	struct snd_pcm_runtime *runtime = substream->runtime;
 	int frames = bytes_to_frames(runtime, len);
 
-	if (runtime->dma_area == NULL || runtime->dma_bytes == 0)
+	if (len == 0 || runtime->dma_area == NULL || runtime->dma_bytes == 0 ||
+	    runtime->period_size == 0)
 		return;
-
-	spin_lock_irqsave(&dev->lock, flags);
-	dev->hw_ptr += frames;
-	if (dev->hw_ptr >= runtime->buffer_size)
-		dev->hw_ptr -= runtime->buffer_size;
-
-	dev->avail += frames;
-	spin_unlock_irqrestore(&dev->lock, flags);
 
 	if (dev->dma_offset + len > runtime->dma_bytes) {
 		int len_to_copy = runtime->dma_bytes - dev->dma_offset;
@@ -115,10 +112,15 @@ void gvusb2_snd_process_pcm(
 	dev->dma_offset += len;
 
 	spin_lock_irqsave(&dev->lock, flags);
+	dev->hw_ptr += frames;
+	while (dev->hw_ptr >= runtime->buffer_size)
+		dev->hw_ptr -= runtime->buffer_size;
+
+	dev->avail += frames;
 	if (dev->avail >= runtime->period_size) {
 		dev->avail -= runtime->period_size;
 		spin_unlock_irqrestore(&dev->lock, flags);
-		snd_pcm_period_elapsed(dev->substream);
+		snd_pcm_period_elapsed(substream);
 		return;
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
@@ -144,21 +146,19 @@ static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		return ret;
 
-	ret = gvusb2_snd_submit_isoc(dev);
-	if (ret < 0) {
-		spin_lock_irqsave(&dev->lock, flags);
-		dev->substream = NULL;
-		spin_unlock_irqrestore(&dev->lock, flags);
-	}
-
-	return ret;
+	return 0;
 }
 
 static int gvusb2_snd_capture_close(struct snd_pcm_substream *substream)
 {
+	unsigned long flags;
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
 
+	spin_lock_irqsave(&dev->lock, flags);
+	dev->running = false;
 	dev->substream = NULL;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
 	gvusb2_snd_cancel_isoc(dev);
 
 	return 0;
@@ -189,6 +189,7 @@ static int gvusb2_snd_hw_free(struct snd_pcm_substream *substream)
 	if (substream->runtime->dma_bytes > 0)
 		vfree(substream->runtime->dma_area);
 
+	substream->runtime->dma_area = NULL;
 	substream->runtime->dma_bytes = 0;
 
 	return 0;
@@ -196,22 +197,52 @@ static int gvusb2_snd_hw_free(struct snd_pcm_substream *substream)
 
 static int gvusb2_snd_pcm_prepare(struct snd_pcm_substream *substream)
 {
-	/* TODO: Do we need this? */
+	unsigned long flags;
+	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
+
+	spin_lock_irqsave(&dev->lock, flags);
+	dev->dma_offset = 0;
+	dev->hw_ptr = 0;
+	dev->avail = 0;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
 	return 0;
 }
 
 /* NOTE: THIS IS ATOMIC */
 static int gvusb2_snd_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
+	unsigned long flags;
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
+	int ret;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		spin_lock_irqsave(&dev->lock, flags);
+		if (dev->running) {
+			spin_unlock_irqrestore(&dev->lock, flags);
+			return 0;
+		}
+		dev->running = true;
+		spin_unlock_irqrestore(&dev->lock, flags);
+
+		ret = gvusb2_snd_submit_isoc(dev, GFP_ATOMIC);
+		if (ret < 0) {
+			spin_lock_irqsave(&dev->lock, flags);
+			dev->running = false;
+			spin_unlock_irqrestore(&dev->lock, flags);
+			return ret;
+		}
+
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->running = false;
 		dev->dma_offset = 0;
 		dev->hw_ptr = 0;
 		dev->avail = 0;
+		spin_unlock_irqrestore(&dev->lock, flags);
+		gvusb2_snd_unlink_isoc(dev);
 		return 0;
 	default:
 		return -EINVAL;
@@ -275,6 +306,7 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 
 	spin_lock_init(&dev->lock);
 	dev->hw_ptr = dev->dma_offset = dev->avail = 0;
+	dev->running = false;
 
 	ret = snd_card_new(&dev->intf->dev, index[crdIdx], ids[crdIdx], THIS_MODULE, 0,
 			&dev->card);
@@ -336,6 +368,18 @@ void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev)
 	}
 }
 
+void gvusb2_snd_unlink_isoc(struct gvusb2_snd *dev)
+{
+	int i;
+
+	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
+		struct urb *urb = dev->urbs[i];
+
+		if (urb != NULL)
+			usb_unlink_urb(urb);
+	}
+}
+
 void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 {
 	int i;
@@ -356,11 +400,16 @@ void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)
 {
 	int i;
 	unsigned char *buf_iter;
+	unsigned long flags;
+	struct snd_pcm_substream *substream;
 
-	if (dev->substream == NULL) {
-		gvusb2_dbg(&dev->intf->dev, "substream is null, skipping processing\n");
+	spin_lock_irqsave(&dev->lock, flags);
+	substream = dev->substream;
+	if (!dev->running || substream == NULL) {
+		spin_unlock_irqrestore(&dev->lock, flags);
 		return;
 	}
+	spin_unlock_irqrestore(&dev->lock, flags);
 
 	buf_iter = urb->transfer_buffer;
 	for (i = 0; i < urb->number_of_packets; i++) {
@@ -368,6 +417,7 @@ void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)
 			gvusb2_dbg(&dev->intf->dev, "bad iso packet. skipping.\n");
 		} else {
 			gvusb2_snd_process_pcm(dev,
+				substream,
 				buf_iter, urb->iso_frame_desc[i].actual_length);
 		}
 
@@ -379,6 +429,8 @@ static void gvusb2_snd_isoc_irq(struct urb *urb)
 {
 	int i, ret;
 	struct gvusb2_snd *dev = urb->context;
+	unsigned long flags;
+	bool running;
 
 	switch (urb->status) {
 	case 0:
@@ -395,6 +447,12 @@ static void gvusb2_snd_isoc_irq(struct urb *urb)
 
 	gvusb2_snd_process_isoc(dev, urb);
 
+	spin_lock_irqsave(&dev->lock, flags);
+	running = dev->running;
+	spin_unlock_irqrestore(&dev->lock, flags);
+	if (!running)
+		return;
+
 	for (i = 0; i < urb->number_of_packets; i++) {
 		urb->iso_frame_desc[i].status = 0;
 		urb->iso_frame_desc[i].actual_length = 0;
@@ -405,17 +463,17 @@ static void gvusb2_snd_isoc_irq(struct urb *urb)
 		gvusb2_dbg(&dev->intf->dev, "urb resubmit failed (%d)\n", ret);
 }
 
-static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev)
+static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev, gfp_t mem_flags)
 {
 	int i, ret;
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
-		ret = usb_submit_urb(dev->urbs[i], GFP_KERNEL);
+		ret = usb_submit_urb(dev->urbs[i], mem_flags);
 		if (ret < 0) {
 			gvusb2_dbg(&dev->intf->dev,
 				"error submitting urb %d\n", ret);
 			while (--i >= 0)
-				usb_kill_urb(dev->urbs[i]);
+				usb_unlink_urb(dev->urbs[i]);
 			return ret;
 		}
 	}
