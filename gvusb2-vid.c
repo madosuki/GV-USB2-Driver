@@ -59,6 +59,11 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 	u32 buffer_len = vb->vb.vb2_buf.planes[0].length;
 	u8 *buffer_addr = vb2_plane_vaddr(&vb->vb.vb2_buf, 0);
 
+	if (buffer_addr == NULL) {
+		vb->error = true;
+		return;
+	}
+
 	get_resolution(dev, &width, 0);
 	bytes_per_line = width * 2;
 
@@ -74,10 +79,7 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 		if (vb->buf_pos + len_to_copy > buffer_len) {
 			dev_warn(&dev->intf->dev,
 				"buffer overflow detected.\n");
-
-			/* this seems to break it somehow? */
-//            memcpy(vb2_plane_vaddr(&vb->vb.vb2_buf, 0) + vb->buf_pos,
-//                        buf, vb->vb.vb2_buf.planes[0].length - vb->buf_pos);
+			vb->error = true;
 			return;
 		}
 
@@ -97,16 +99,20 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 static inline void gvusb2_vid_submit_video_buffer(struct gvusb2_vid *dev)
 {
 	struct gvusb2_vb *vb = dev->current_buf;
+	enum vb2_buffer_state state;
+	u32 buffer_len = vb->vb.vb2_buf.planes[0].length;
+	u32 payload = vb->buf_pos;
 
-	/* submit buffer */
-	/* TODO: Do we set this even if it's too small? */
-	vb2_set_plane_payload(&vb->vb.vb2_buf, 0,
-		vb->vb.vb2_buf.planes[0].length);
+	if (payload > buffer_len)
+		payload = buffer_len;
+
+	state = vb->error ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
+	vb2_set_plane_payload(&vb->vb.vb2_buf, 0, payload);
 
 	vb->vb.sequence = dev->sequence++;
 	vb->vb.field = V4L2_FIELD_INTERLACED;
 	vb->vb.vb2_buf.timestamp = ktime_get_ns();
-	vb2_buffer_done(&vb->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	vb2_buffer_done(&vb->vb.vb2_buf, state);
 
 	dev->current_buf = NULL;
 
@@ -393,8 +399,9 @@ static void gvusb2_stk1150_init(struct gvusb2_vid *dev)
  * Driver functions
  ****************************************************************************/
 
-static void gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
-	struct usb_endpoint_descriptor **video_ep)
+static bool gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
+	struct usb_endpoint_descriptor **video_ep, int *interface_num,
+	int *altsetting_num)
 {
 	int ep;
 	int num_endpoints = intf->altsetting[i].desc.bNumEndpoints;
@@ -411,11 +418,18 @@ static void gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
 				/* this corresponds to max 0xc00 bytes */
 				e->wMaxPacketSize == 0x1400) {
 			*video_ep = e;
+			*interface_num =
+				intf->altsetting[i].desc.bInterfaceNumber;
+			*altsetting_num =
+				intf->altsetting[i].desc.bAlternateSetting;
 			gvusb2_dbg(&intf->dev,
 				"found video at altsetting %d endpoint %d\n",
 				i, ep);
+			return true;
 		}
 	}
+
+	return false;
 }
 
 int gvusb2_vid_free(struct gvusb2_vid *dev)
@@ -453,14 +467,16 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	struct usb_device *udev;
 	struct gvusb2_vid *dev;
 	int i, ret;
+	int interface_num = -1;
+	int altsetting_num = -1;
 	struct usb_endpoint_descriptor *video_ep = NULL;
 
 	udev = interface_to_usbdev(intf);
 
 	/* check if we're on the video interface */
 	for (i = 0; i < intf->num_altsetting; i++) {
-		gvusb2_vid_check_altsetting(intf, i, &video_ep);
-		if (video_ep != NULL)
+		if (gvusb2_vid_check_altsetting(intf, i, &video_ep,
+				&interface_num, &altsetting_num))
 			break;
 	}
 
@@ -478,8 +494,7 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (ret < 0)
 		goto free_dev;
 
-	/* XXX: No hardcoding here. */
-	ret = usb_set_interface(udev, 0, 5);
+	ret = usb_set_interface(udev, interface_num, altsetting_num);
 	if (ret < 0)
 		goto free_gvusb2;
 

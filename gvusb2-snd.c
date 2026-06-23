@@ -537,6 +537,8 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	struct usb_device *udev;
 	struct gvusb2_snd *dev;
 	int i, ret;
+	int interface_num = -1;
+	int altsetting_num = -1;
 	struct usb_endpoint_descriptor *audio_ep = NULL;
 
 	udev = interface_to_usbdev(intf);
@@ -561,10 +563,18 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 					usb_endpoint_xfer_isoc(e) &&
 					e->wMaxPacketSize == 0x100) {
 				audio_ep = e;
+				interface_num =
+					intf->altsetting[i].desc.bInterfaceNumber;
+				altsetting_num =
+					intf->altsetting[i].desc.bAlternateSetting;
 				gvusb2_dbg(&intf->dev, "found audio at altsetting %d endpoint %d\n",
 					i, ep);
+				break;
 			}
 		}
+
+		if (audio_ep != NULL)
+			break;
 	}
 
 	/* if we don't have an audio device, we don't accept */
@@ -581,8 +591,7 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (ret < 0)
 		goto free_dev;
 
-	/* XXX: No hardcoding here. */
-	ret = usb_set_interface(udev, 2, 1);
+	ret = usb_set_interface(udev, interface_num, altsetting_num);
 	if (ret < 0)
 		goto free_gvusb2;
 

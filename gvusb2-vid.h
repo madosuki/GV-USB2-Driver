@@ -35,6 +35,7 @@ struct gvusb2_vb {
 	int buf_pos;
 	int line_pos;
 	int field;
+	bool error;
 };
 
 struct gvusb2_vid {
