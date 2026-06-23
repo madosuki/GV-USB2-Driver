@@ -107,3 +107,69 @@ the modules loaded:
 sudo nixos-rebuild switch --flake .#host
 lsmod | grep gvusb2
 ```
+
+With a non-flake NixOS configuration, define the kernel module package in your
+configuration and add it to `boot.extraModulePackages`. The package must use
+the same kernel package set as `boot.kernelPackages`; using
+`config.boot.kernelPackages` keeps those values tied together:
+
+```nix
+{ config, pkgs, lib, ... }:
+
+let
+  gvusb2Driver = pkgs.stdenv.mkDerivation {
+    pname = "gvusb2-driver";
+    version = "unstable";
+
+    src = pkgs.fetchFromGitHub {
+      owner = "your-name";
+      repo = "GV-USB2-Driver";
+      rev = "COMMIT_OR_TAG";
+      hash = lib.fakeHash;
+    };
+
+    nativeBuildInputs = config.boot.kernelPackages.kernel.moduleBuildDependencies;
+    hardeningDisable = [ "pic" ];
+
+    buildPhase =
+      let
+        kernel = config.boot.kernelPackages.kernel;
+        kbuildDir = "${kernel.dev}/lib/modules/${kernel.modDirVersion}/build";
+      in
+      ''
+        runHook preBuild
+        make -C ${kbuildDir} M=$PWD modules
+        runHook postBuild
+      '';
+
+    installPhase =
+      let
+        kernel = config.boot.kernelPackages.kernel;
+      in
+      ''
+        runHook preInstall
+        install -D -m 0644 gvusb2-sound.ko \
+          $out/lib/modules/${kernel.modDirVersion}/extra/gvusb2-sound.ko
+        install -D -m 0644 gvusb2-video.ko \
+          $out/lib/modules/${kernel.modDirVersion}/extra/gvusb2-video.ko
+        runHook postInstall
+      '';
+  };
+in
+{
+  boot.kernelPackages = pkgs.linuxPackages_latest;
+
+  boot.extraModulePackages = [
+    gvusb2Driver
+  ];
+
+  boot.kernelModules = [
+    "gvusb2-sound"
+    "gvusb2-video"
+  ];
+}
+```
+
+Replace `COMMIT_OR_TAG` with the revision to pin. If you do not know the hash
+yet, put `lib.fakeHash` in `hash`, run `sudo nixos-rebuild switch`, and replace
+it with the hash reported by Nix.
