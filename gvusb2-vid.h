@@ -48,6 +48,7 @@ struct gvusb2_vid {
 	struct urb *urbs[GVUSB2_NUM_URBS];
 	/* keeps track of packet seq */
 	unsigned char counter;
+	bool disconnected;
 
 	/* i2c data */
 	struct i2c_adapter adap;

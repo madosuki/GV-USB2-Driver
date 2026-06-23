@@ -80,13 +80,14 @@ int gvusb2_set_reg_mask(struct gvusb2_dev *dev, u16 reg, u8 mask, u8 value)
 
 int gvusb2_init(struct gvusb2_dev *dev, struct usb_device *udev)
 {
-	dev->udev = udev;
+	dev->udev = usb_get_dev(udev);
 	return 0;
 }
 
 int gvusb2_free(struct gvusb2_dev *dev)
 {
-	/* nothing here, yet */
+	usb_put_dev(dev->udev);
+	dev->udev = NULL;
 	return 0;
 }
 

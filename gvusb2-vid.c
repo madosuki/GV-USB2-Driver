@@ -201,6 +201,9 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
 	int i, ret;
 	struct gvusb2_vid *dev = urb->context;
 
+	if (READ_ONCE(dev->disconnected))
+		return;
+
 	switch (urb->status) {
 	case 0:
 		break;
@@ -220,6 +223,9 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
 		urb->iso_frame_desc[i].status = 0;
 		urb->iso_frame_desc[i].actual_length = 0;
 	}
+
+	if (READ_ONCE(dev->disconnected))
+		return;
 
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
 	if (ret)
@@ -296,6 +302,9 @@ int gvusb2_vid_submit_urbs(struct gvusb2_vid *dev)
 {
 	int i;
 	int ret;
+
+	if (dev->disconnected)
+		return -ENODEV;
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		ret = usb_submit_urb(dev->urbs[i], GFP_KERNEL);
@@ -501,6 +510,7 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	/* initialize gvusb2_vid data */
 	dev->ep = video_ep;
 	dev->intf = intf;
+	dev->disconnected = false;
 
 	/* initialize the stk1150 in the gvusb2 */
 	gvusb2_stk1150_init(dev);
@@ -552,9 +562,14 @@ void gvusb2_vid_disconnect(struct usb_interface *intf)
 	/* remove our data from the interface */
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
+	if (dev == NULL)
+		return;
 
 	mutex_lock(&dev->vb2q_lock);
 	mutex_lock(&dev->v4l2_lock);
+
+	dev->disconnected = true;
+	vb2_queue_error(&dev->vb2q);
 
 	/* cancel urbs */
 	gvusb2_vid_cancel_urbs(dev);

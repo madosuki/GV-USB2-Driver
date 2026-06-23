@@ -137,6 +137,11 @@ static void gvusb2_vb2_buf_queue(struct vb2_buffer *vb)
 	struct gvusb2_vb *gvusb2_vbuf =
 		container_of(vbuf, struct gvusb2_vb, vb);
 
+	if (dev->disconnected) {
+		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
 	spin_lock_irqsave(&dev->buf_list_lock, flags);
 
 	gvusb2_vbuf->buf_pos = 0;
@@ -158,6 +163,11 @@ static int gvusb2_vb2_start_streaming(struct vb2_queue *vb2q,
 	/* start mutex */
 	if (mutex_lock_interruptible(&dev->v4l2_lock))
 		return -ERESTARTSYS;
+
+	if (dev->disconnected) {
+		ret = -ENODEV;
+		goto clear_queue;
+	}
 
 	/* set seq to 0 */
 	dev->sequence = 0;
@@ -230,6 +240,9 @@ static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
 	/* cancel urbs */
 	gvusb2_vid_cancel_urbs(dev);
 
+	if (dev->disconnected)
+		goto clear_queue;
+
 	/* stop gvusb2 */
 	gvusb2_write_reg(&dev->gv, 0x0100, 0x33);
 	/* probably don't need to set no VBI */
@@ -238,6 +251,7 @@ static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
 	/* stop tw9910 */
 	v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 0);
 
+clear_queue:
 	/* clear queue */
 	gvusb2_vid_clear_queue(dev);
 
@@ -290,6 +304,9 @@ static int gvusb2_s_ctrl(struct v4l2_ctrl *ctrl)
 	struct gvusb2_vid *dev = container_of(ctrl->handler,
 		struct gvusb2_vid, ctrl_handler);
 	int ret;
+
+	if (dev->disconnected)
+		return -ENODEV;
 
 	switch (ctrl->id) {
 	case V4L2_CID_BRIGHTNESS:
@@ -380,6 +397,9 @@ static int gvusb2_vidioc_querycap(struct file *file, void *priv,
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
 
+	if (dev->disconnected)
+		return -ENODEV;
+
 	strscpy(cap->driver, "gvusb2", sizeof(cap->driver));
 	strscpy(cap->card, "gvusb2", sizeof(cap->card));
 	usb_make_path(dev->gv.udev, cap->bus_info, sizeof(cap->bus_info));
@@ -426,6 +446,9 @@ static int gvusb2_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 	struct gvusb2_vid *dev = video_drvdata(file);
 	u8 val;
 	s32 reg;
+
+	if (dev->disconnected)
+		return -ENODEV;
 
 	switch (i) {
 	case GVUSB2_INPUT_COMPOSITE:
@@ -479,6 +502,9 @@ static int gvusb2_vidioc_s_std(struct file *file, void *priv, v4l2_std_id std)
 	struct gvusb2_vid *dev = video_drvdata(file);
 	struct vb2_queue *vb2q = &dev->vb2q;
 
+	if (dev->disconnected)
+		return -ENODEV;
+
 	if (std == dev->standard)
 		return 0;
 
@@ -520,6 +546,9 @@ static int gvusb2_vidioc_s_fmt_vid_cap(struct file *file, void *priv,
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
 	struct vb2_queue *vb2q = &dev->vb2q;
+
+	if (dev->disconnected)
+		return -ENODEV;
 
 	if (vb2_is_busy(vb2q))
 		return -EBUSY;
