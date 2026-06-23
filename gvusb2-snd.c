@@ -54,6 +54,8 @@ struct gvusb2_snd {
 	int avail;
 	int hw_ptr;
 	bool running;
+	bool disconnected;
+	bool release_on_card_free;
 	spinlock_t lock;
 };
 
@@ -79,6 +81,7 @@ static struct snd_pcm_hardware gvusb2_snd_hw = {
 static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev, gfp_t mem_flags);
 static void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev);
 static void gvusb2_snd_unlink_isoc(struct gvusb2_snd *dev);
+static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev);
 
 /*****************************************************************************
  *  Alsa Stuff
@@ -134,7 +137,9 @@ static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
 	spin_lock_irqsave(&dev->lock, flags);
-	if (dev->substream == NULL) {
+	if (dev->disconnected) {
+		ret = -ENODEV;
+	} else if (dev->substream == NULL) {
 		dev->substream = substream;
 		runtime->hw = gvusb2_snd_hw;
 		ret = 0;
@@ -219,6 +224,10 @@ static int gvusb2_snd_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		spin_lock_irqsave(&dev->lock, flags);
+		if (dev->disconnected) {
+			spin_unlock_irqrestore(&dev->lock, flags);
+			return -ENODEV;
+		}
 		if (dev->running) {
 			spin_unlock_irqrestore(&dev->lock, flags);
 			return 0;
@@ -269,8 +278,14 @@ static struct page *gvusb2_snd_pcm_page(
 
 static int gvusb2_snd_dev_free(struct snd_device *device)
 {
-	/* deallocate all sound card device stuff */
-	/* TODO: do we need this? */
+	struct gvusb2_snd *dev = device->device_data;
+
+	if (!dev->release_on_card_free)
+		return 0;
+
+	gvusb2_snd_free_isoc(dev);
+	gvusb2_free(&dev->gv);
+	kfree(dev);
 
 	return 0;
 }
@@ -307,18 +322,13 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 	spin_lock_init(&dev->lock);
 	dev->hw_ptr = dev->dma_offset = dev->avail = 0;
 	dev->running = false;
+	dev->disconnected = false;
+	dev->release_on_card_free = false;
 
 	ret = snd_card_new(&dev->intf->dev, index[crdIdx], ids[crdIdx], THIS_MODULE, 0,
 			&dev->card);
 	if (ret < 0)
 		return ret;
-
-	ret = snd_device_new(dev->card, SNDRV_DEV_LOWLEVEL, dev,
-		&gvusb2_snd_device_ops);
-	if (ret < 0) {
-		snd_card_free(dev->card);
-		return ret;
-	}
 
 	ret = snd_pcm_new(dev->card, "analog in", 0, 0, 1, &dev->pcm);
 	if (ret < 0) {
@@ -335,6 +345,13 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 	strscpy(dev->card->longname, "gvusb2", sizeof(dev->card->longname));
 	strscpy(dev->card->driver, "gvusb2-snd", sizeof(dev->card->driver));
 
+	ret = snd_device_new(dev->card, SNDRV_DEV_LOWLEVEL, dev,
+		&gvusb2_snd_device_ops);
+	if (ret < 0) {
+		snd_card_free(dev->card);
+		return ret;
+	}
+
 	/* register the card */
 	ret = snd_card_register(dev->card);
 	if (ret < 0) {
@@ -342,13 +359,39 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 		return ret;
 	}
 
+	dev->release_on_card_free = true;
+
 	return 0;
 }
 
 static void gvusb2_snd_alsa_free(struct gvusb2_snd *dev)
 {
 	snd_card_free(dev->card);
-	dev->card = NULL;
+}
+
+static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
+{
+	struct snd_pcm_substream *substream;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->lock, flags);
+	dev->disconnected = true;
+	dev->running = false;
+	substream = dev->substream;
+	spin_unlock_irqrestore(&dev->lock, flags);
+
+	snd_card_disconnect(dev->card);
+
+	if (substream && substream->runtime) {
+		snd_pcm_stream_lock_irq(substream);
+		if (substream->runtime->state != SNDRV_PCM_STATE_OPEN &&
+		    substream->runtime->state != SNDRV_PCM_STATE_DISCONNECTED)
+			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
+		snd_pcm_stream_unlock_irq(substream);
+	}
+
+	gvusb2_snd_cancel_isoc(dev);
+	snd_card_free_when_closed(dev->card);
 }
 
 /*****************************************************************************
@@ -380,7 +423,7 @@ void gvusb2_snd_unlink_isoc(struct gvusb2_snd *dev)
 	}
 }
 
-void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
+static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 {
 	int i;
 
@@ -621,13 +664,12 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 
 free_alsa:
 	gvusb2_snd_alsa_free(dev);
+	return ret;
 
 free_gvusb2:
 	gvusb2_free(&dev->gv);
-
 free_dev:
 	kfree(dev);
-
 	return ret;
 }
 
@@ -639,17 +681,10 @@ void gvusb2_snd_disconnect(struct usb_interface *intf)
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
 
-	/* free isoc urbs */
-	gvusb2_snd_free_isoc(dev);
+	if (dev == NULL)
+		return;
 
-	/* free the sound card */
-	gvusb2_snd_alsa_free(dev);
-
-	/* free the internal gvusb2 device */
-	gvusb2_free(&dev->gv);
-
-	/* free me */
-	kfree(dev);
+	gvusb2_snd_alsa_disconnect(dev);
 }
 
 static struct usb_driver gvusb2_snd_usb_driver = {
