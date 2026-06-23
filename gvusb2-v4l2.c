@@ -158,15 +158,14 @@ static int gvusb2_vb2_start_streaming(struct vb2_queue *vb2q,
 	/* probably don't need to set no VBI */
 	gvusb2_write_reg(&dev->gv, 0x0103, 0x00);
 
-	/* submit urbs */
 	ret = gvusb2_vid_submit_urbs(dev);
 	if (ret < 0)
-		return ret;
+		goto unlock;
 
-	/* stop mutex */
+unlock:
 	mutex_unlock(&dev->v4l2_lock);
 
-	return 0;
+	return ret;
 }
 
 static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
@@ -222,6 +221,7 @@ int gvusb2_vb2_setup(struct gvusb2_vid *dev)
 	vb2q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 
 	INIT_LIST_HEAD(&dev->buf_list);
+	spin_lock_init(&dev->buf_list_lock);
 
 	ret = vb2_queue_init(vb2q);
 	if (ret < 0)
@@ -378,7 +378,8 @@ static int gvusb2_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 	if (reg < 0)
 		return reg;
 
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x02, (reg & 0xc3) | val);
+	reg = i2c_smbus_write_byte_data(&dev->i2c_client, 0x02,
+		(reg & 0xc3) | val);
 	if (reg < 0)
 		return reg;
 

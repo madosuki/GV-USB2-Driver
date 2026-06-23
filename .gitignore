@@ -62,3 +62,12 @@ install.sh
 compile_commands.json
 
 *.plist
+
+# exclude nix build result
+result
+result/
+
+.agents
+.agents/
+.codex
+.codex/

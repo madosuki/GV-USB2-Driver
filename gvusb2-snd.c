@@ -90,6 +90,9 @@ void gvusb2_snd_process_pcm(
 	struct snd_pcm_runtime *runtime = dev->substream->runtime;
 	int frames = bytes_to_frames(runtime, len);
 
+	if (runtime->dma_area == NULL || runtime->dma_bytes == 0)
+		return;
+
 	spin_lock_irqsave(&dev->lock, flags);
 	dev->hw_ptr += frames;
 	if (dev->hw_ptr >= runtime->buffer_size)
@@ -128,10 +131,6 @@ static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
 	struct gvusb2_snd *dev = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
-	ret = gvusb2_snd_submit_isoc(dev);
-	if (ret < 0)
-		return ret;
-
 	spin_lock_irqsave(&dev->lock, flags);
 	if (dev->substream == NULL) {
 		dev->substream = substream;
@@ -141,6 +140,16 @@ static int gvusb2_snd_capture_open(struct snd_pcm_substream *substream)
 		ret = -EBUSY;
 	}
 	spin_unlock_irqrestore(&dev->lock, flags);
+
+	if (ret < 0)
+		return ret;
+
+	ret = gvusb2_snd_submit_isoc(dev);
+	if (ret < 0) {
+		spin_lock_irqsave(&dev->lock, flags);
+		dev->substream = NULL;
+		spin_unlock_irqrestore(&dev->lock, flags);
+	}
 
 	return ret;
 }
@@ -323,7 +332,7 @@ void gvusb2_snd_cancel_isoc(struct gvusb2_snd *dev)
 		struct urb *urb = dev->urbs[i];
 
 		if (urb != NULL)
-			usb_kill_urb(dev->urbs[i]);
+			usb_kill_urb(urb);
 	}
 }
 
@@ -402,10 +411,13 @@ static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev)
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		ret = usb_submit_urb(dev->urbs[i], GFP_KERNEL);
-		if (ret < 0)
-			/* TODO: clean up */
+		if (ret < 0) {
 			gvusb2_dbg(&dev->intf->dev,
 				"error submitting urb %d\n", ret);
+			while (--i >= 0)
+				usb_kill_urb(dev->urbs[i]);
+			return ret;
+		}
 	}
 
 	return 0;
