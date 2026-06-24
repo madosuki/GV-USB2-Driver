@@ -67,6 +67,8 @@ sudo rmmod gvusb2_sound
 For regular use, build the modules as part of the NixOS system closure instead
 of manually inserting `.ko` files. The important detail is that the selected
 flake package must be built for the same kernel package set used by the system.
+The video module also needs the in-tree `usbtv` module, so load `usbtv` before
+`gvusb2-video`.
 
 With a flake-based NixOS configuration:
 
@@ -88,6 +90,7 @@ With a flake-based NixOS configuration:
           ];
 
           boot.kernelModules = [
+            "usbtv"
             "gvusb2-sound"
             "gvusb2-video"
           ];
@@ -100,12 +103,18 @@ With a flake-based NixOS configuration:
 
 Use `gvusb2.packages.${pkgs.system}.stable` with `pkgs.linuxPackages`, or
 `gvusb2.packages.${pkgs.system}.testing` with `pkgs.linuxPackages_testing`.
+`boot.extraModulePackages` only installs the out-of-tree modules into the
+kernel module tree; module loading is handled by `modprobe`. The
+`gvusb2-video` module declares `softdep: pre: usbtv`, but listing `usbtv`
+explicitly in `boot.kernelModules` makes the NixOS boot-time dependency
+visible in the system configuration.
+
 After rebuilding and booting the new system, plug in the GV-USB2 and check that
 the modules loaded:
 
 ```sh
 sudo nixos-rebuild switch --flake .#host
-lsmod | grep gvusb2
+lsmod | grep -E 'usbtv|gvusb2'
 ```
 
 With a non-flake NixOS configuration, define the kernel module package in your
@@ -164,6 +173,7 @@ in
   ];
 
   boot.kernelModules = [
+    "usbtv"
     "gvusb2-sound"
     "gvusb2-video"
   ];

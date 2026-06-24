@@ -20,6 +20,7 @@
 MODULE_DESCRIPTION("gvusb2 video driver");
 MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_SOFTDEP("pre: usbtv");
 
 static const struct usb_device_id gvusb2_id_table[] = {
 	{ USB_DEVICE(GVUSB2_VENDOR_ID, GVUSB2_PRODUCT_ID) },
