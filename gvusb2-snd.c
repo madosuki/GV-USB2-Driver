@@ -372,14 +372,11 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 {
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
-	bool release_usb_resources;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	dev->disconnected = true;
 	dev->running = false;
 	substream = dev->substream;
-	release_usb_resources = !dev->usb_resources_released;
-	dev->usb_resources_released = true;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	snd_card_disconnect(dev->card);
@@ -393,9 +390,6 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 	}
 
 	gvusb2_snd_cancel_isoc(dev);
-	if (release_usb_resources) {
-		gvusb2_free(&dev->gv);
-	}
 	snd_card_free_when_closed(dev->card);
 }
 
