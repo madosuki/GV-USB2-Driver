@@ -15,6 +15,9 @@
 
 #include <linux/module.h>
 
+struct usb_device_id;
+struct usb_interface;
+
 #define GVUSB2_NUM_URBS 4
 #define GVUSB2_NUM_ISOCH_PACKETS 0x100
 #define GVUSB2_MAX_AUDIO_PACKET_SIZE 0x100
@@ -24,6 +27,12 @@
 
 #define gvusb2_dbg(dev, fmt, args...) \
 	dev_info(dev, fmt, ## args)
+
+enum gvusb2_interface_type {
+	GVUSB2_INTF_UNKNOWN = 0,
+	GVUSB2_INTF_VIDEO,
+	GVUSB2_INTF_SOUND,
+};
 
 struct gvusb2_dev {
 	struct usb_device *udev;
@@ -36,5 +45,10 @@ int gvusb2_init(struct gvusb2_dev *dev, struct usb_device *udev);
 int gvusb2_free(struct gvusb2_dev *dev);
 
 int gvusb2_snd_reset_adc(struct gvusb2_dev *dev);
+
+int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id);
+void gvusb2_vid_disconnect(struct usb_interface *intf);
+int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id);
+void gvusb2_snd_disconnect(struct usb_interface *intf);
 
 #endif

@@ -39,6 +39,8 @@ struct gvusb2_vb {
 };
 
 struct gvusb2_vid {
+	enum gvusb2_interface_type type;
+
 	/* core data */
 	struct gvusb2_dev gv;
 

@@ -37,7 +37,8 @@ static int gvusb2_i2c_busy_wait(struct gvusb2_vid *dev, u8 wait_mask)
 	return -ETIMEDOUT;
 }
 
-int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg, u8 *value)
+static int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg,
+	u8 *value)
 {
 	int ret;
 
@@ -68,7 +69,8 @@ int gvusb2_i2c_read_reg(struct gvusb2_vid *dev, u8 addr, u8 reg, u8 *value)
 	return 0;
 }
 
-int gvusb2_i2c_write_reg(struct gvusb2_vid *dev, u8 addr, u8 reg, u8 value)
+static int gvusb2_i2c_write_reg(struct gvusb2_vid *dev, u8 addr, u8 reg,
+	u8 value)
 {
 	int ret;
 
