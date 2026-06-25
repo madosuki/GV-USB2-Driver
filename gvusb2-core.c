@@ -20,9 +20,13 @@
 int gvusb2_read_reg(struct gvusb2_dev *dev, u16 reg, u8 *value)
 {
 	int ret;
-	int pipe = usb_rcvctrlpipe(dev->udev, 0);
+	int pipe;
 	u8 *buf;
 
+	if (dev->udev == NULL)
+		return -ENODEV;
+
+	pipe = usb_rcvctrlpipe(dev->udev, 0);
 	buf = kmalloc(sizeof(u8), GFP_KERNEL);
 	if (buf == NULL)
 		return -ENOMEM;
@@ -48,8 +52,12 @@ int gvusb2_read_reg(struct gvusb2_dev *dev, u16 reg, u8 *value)
 int gvusb2_write_reg(struct gvusb2_dev *dev, u16 reg, u8 value)
 {
 	int ret;
-	int pipe = usb_sndctrlpipe(dev->udev, 0);
+	int pipe;
 
+	if (dev->udev == NULL)
+		return -ENODEV;
+
+	pipe = usb_sndctrlpipe(dev->udev, 0);
 	ret = usb_control_msg(dev->udev, pipe, 0x01,
 		USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
 		value, reg, NULL, 0, HZ);
@@ -86,6 +94,9 @@ int gvusb2_init(struct gvusb2_dev *dev, struct usb_device *udev)
 
 int gvusb2_free(struct gvusb2_dev *dev)
 {
+	if (dev->udev == NULL)
+		return 0;
+
 	usb_put_dev(dev->udev);
 	dev->udev = NULL;
 	return 0;

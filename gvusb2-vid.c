@@ -448,7 +448,8 @@ int gvusb2_vid_free(struct gvusb2_vid *dev)
 	gvusb2_vid_free_urbs(dev);
 
 	/* free gvusb2 */
-	gvusb2_free(&dev->gv);
+	if (!dev->usb_resources_released)
+		gvusb2_free(&dev->gv);
 
 	/* free me */
 	kfree(dev);
@@ -512,6 +513,7 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	dev->ep = video_ep;
 	dev->intf = intf;
 	dev->disconnected = false;
+	dev->usb_resources_released = false;
 
 	/* initialize the stk1150 in the gvusb2 */
 	gvusb2_stk1150_init(dev);
@@ -575,6 +577,10 @@ void gvusb2_vid_disconnect(struct usb_interface *intf)
 	/* cancel urbs */
 	gvusb2_vid_cancel_urbs(dev);
 	gvusb2_vid_free_urbs(dev);
+	if (!dev->usb_resources_released) {
+		gvusb2_free(&dev->gv);
+		dev->usb_resources_released = true;
+	}
 
 	/* clear buffer list queue */
 	gvusb2_vid_clear_queue(dev);

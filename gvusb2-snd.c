@@ -57,6 +57,7 @@ struct gvusb2_snd {
 	bool disconnected;
 	bool release_on_card_free;
 	bool usb_resources_released;
+	bool isoc_resources_released;
 	spinlock_t lock;
 };
 
@@ -284,8 +285,10 @@ static int gvusb2_snd_dev_free(struct snd_device *device)
 	if (!dev->release_on_card_free)
 		return 0;
 
-	if (!dev->usb_resources_released) {
+	if (!dev->isoc_resources_released)
 		gvusb2_snd_free_isoc(dev);
+
+	if (!dev->usb_resources_released) {
 		gvusb2_free(&dev->gv);
 		dev->usb_resources_released = true;
 	}
@@ -329,6 +332,7 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 	dev->disconnected = false;
 	dev->release_on_card_free = false;
 	dev->usb_resources_released = false;
+	dev->isoc_resources_released = false;
 
 	ret = snd_card_new(&dev->intf->dev, index[crdIdx], ids[crdIdx], THIS_MODULE, 0,
 			&dev->card);
@@ -400,7 +404,6 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 
 	gvusb2_snd_cancel_isoc(dev);
 	if (release_usb_resources) {
-		gvusb2_snd_free_isoc(dev);
 		gvusb2_free(&dev->gv);
 	}
 	snd_card_free_when_closed(dev->card);
@@ -439,6 +442,9 @@ static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 {
 	int i;
 
+	if (dev->isoc_resources_released)
+		return;
+
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		struct urb *urb = dev->urbs[i];
 
@@ -449,6 +455,8 @@ static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 			dev->urbs[i] = NULL;
 		}
 	}
+
+	dev->isoc_resources_released = true;
 }
 
 void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)

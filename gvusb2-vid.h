@@ -49,6 +49,7 @@ struct gvusb2_vid {
 	/* keeps track of packet seq */
 	unsigned char counter;
 	bool disconnected;
+	bool usb_resources_released;
 
 	/* i2c data */
 	struct i2c_adapter adap;
