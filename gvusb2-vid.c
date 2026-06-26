@@ -36,7 +36,7 @@ static inline
 struct gvusb2_vb *gvusb2_vid_next_buffer(struct gvusb2_vid *dev)
 {
 	struct gvusb2_vb *buf = NULL;
-	unsigned long flags;
+	unsigned long flags = 0;
 
 	WARN_ON(dev->current_buf);
 
@@ -462,10 +462,10 @@ void gvusb2_release(struct v4l2_device *v4l2_dev)
 	struct gvusb2_vid *dev =
 		container_of(v4l2_dev, struct gvusb2_vid, v4l2_dev);
 
+    v4l2_device_unregister(&dev->v4l2_dev);
+    v4l2_ctrl_handler_free(&dev->ctrl_handler);
+    
 	gvusb2_i2c_unregister(dev);
-
-	v4l2_ctrl_handler_free(&dev->ctrl_handler);
-	v4l2_device_unregister(&dev->v4l2_dev);
 
 	mutex_destroy(&dev->v4l2_lock);
 	mutex_destroy(&dev->vb2q_lock);

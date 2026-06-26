@@ -380,6 +380,7 @@ static void gvusb2_snd_alsa_free(struct gvusb2_snd *dev)
 
 static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 {
+  pr_debug("gvusb2 disconnect func run!");
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
 	bool release_usb_resources;
