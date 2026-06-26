@@ -54,3 +54,20 @@ dkms.conf
 # custom stuff
 .vscode/
 install.sh
+
+# ignore clangd files
+.cache/
+
+# ignore bear -- make results
+compile_commands.json
+
+*.plist
+
+# exclude nix build result
+result
+result/
+
+.agents
+.agents/
+.codex
+.codex/

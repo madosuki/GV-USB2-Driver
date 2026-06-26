@@ -20,6 +20,7 @@
 MODULE_DESCRIPTION("gvusb2 video driver");
 MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_SOFTDEP("pre: usbtv");
 
 static const struct usb_device_id gvusb2_id_table[] = {
 	{ USB_DEVICE(GVUSB2_VENDOR_ID, GVUSB2_PRODUCT_ID) },
@@ -35,7 +36,7 @@ static inline
 struct gvusb2_vb *gvusb2_vid_next_buffer(struct gvusb2_vid *dev)
 {
 	struct gvusb2_vb *buf = NULL;
-	unsigned long flags;
+	unsigned long flags = 0;
 
 	WARN_ON(dev->current_buf);
 
@@ -59,6 +60,11 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 	u32 buffer_len = vb->vb.vb2_buf.planes[0].length;
 	u8 *buffer_addr = vb2_plane_vaddr(&vb->vb.vb2_buf, 0);
 
+	if (buffer_addr == NULL) {
+		vb->error = true;
+		return;
+	}
+
 	get_resolution(dev, &width, 0);
 	bytes_per_line = width * 2;
 
@@ -74,10 +80,7 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 		if (vb->buf_pos + len_to_copy > buffer_len) {
 			dev_warn(&dev->intf->dev,
 				"buffer overflow detected.\n");
-
-			/* this seems to break it somehow? */
-//            memcpy(vb2_plane_vaddr(&vb->vb.vb2_buf, 0) + vb->buf_pos,
-//                        buf, vb->vb.vb2_buf.planes[0].length - vb->buf_pos);
+			vb->error = true;
 			return;
 		}
 
@@ -97,16 +100,20 @@ void gvusb2_vid_copy_video(struct gvusb2_vid *dev, u8 *buf, int len)
 static inline void gvusb2_vid_submit_video_buffer(struct gvusb2_vid *dev)
 {
 	struct gvusb2_vb *vb = dev->current_buf;
+	enum vb2_buffer_state state;
+	u32 buffer_len = vb->vb.vb2_buf.planes[0].length;
+	u32 payload = vb->buf_pos;
 
-	/* submit buffer */
-	/* TODO: Do we set this even if it's too small? */
-	vb2_set_plane_payload(&vb->vb.vb2_buf, 0,
-		vb->vb.vb2_buf.planes[0].length);
+	if (payload > buffer_len)
+		payload = buffer_len;
+
+	state = vb->error ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
+	vb2_set_plane_payload(&vb->vb.vb2_buf, 0, payload);
 
 	vb->vb.sequence = dev->sequence++;
 	vb->vb.field = V4L2_FIELD_INTERLACED;
 	vb->vb.vb2_buf.timestamp = ktime_get_ns();
-	vb2_buffer_done(&vb->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	vb2_buffer_done(&vb->vb.vb2_buf, state);
 
 	dev->current_buf = NULL;
 
@@ -195,6 +202,9 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
 	int i, ret;
 	struct gvusb2_vid *dev = urb->context;
 
+	if (READ_ONCE(dev->disconnected))
+		return;
+
 	switch (urb->status) {
 	case 0:
 		break;
@@ -214,6 +224,9 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
 		urb->iso_frame_desc[i].status = 0;
 		urb->iso_frame_desc[i].actual_length = 0;
 	}
+
+	if (READ_ONCE(dev->disconnected))
+		return;
 
 	ret = usb_submit_urb(urb, GFP_ATOMIC);
 	if (ret)
@@ -291,11 +304,16 @@ int gvusb2_vid_submit_urbs(struct gvusb2_vid *dev)
 	int i;
 	int ret;
 
+	if (dev->disconnected)
+		return -ENODEV;
+
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
 		ret = usb_submit_urb(dev->urbs[i], GFP_KERNEL);
 		if (ret < 0) {
 			gvusb2_dbg(&dev->intf->dev,
 				"urb submit failed (%d)\n", ret);
+			while (--i >= 0)
+				usb_kill_urb(dev->urbs[i]);
 			return ret;
 		}
 	}
@@ -308,7 +326,8 @@ void gvusb2_vid_cancel_urbs(struct gvusb2_vid *dev)
 	int i;
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++)
-		usb_kill_urb(dev->urbs[i]);
+		if (dev->urbs[i] != NULL)
+			usb_kill_urb(dev->urbs[i]);
 }
 
 /*****************************************************************************
@@ -390,8 +409,9 @@ static void gvusb2_stk1150_init(struct gvusb2_vid *dev)
  * Driver functions
  ****************************************************************************/
 
-static void gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
-	struct usb_endpoint_descriptor **video_ep)
+static bool gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
+	struct usb_endpoint_descriptor **video_ep, int *interface_num,
+	int *altsetting_num)
 {
 	int ep;
 	int num_endpoints = intf->altsetting[i].desc.bNumEndpoints;
@@ -408,11 +428,18 @@ static void gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
 				/* this corresponds to max 0xc00 bytes */
 				e->wMaxPacketSize == 0x1400) {
 			*video_ep = e;
+			*interface_num =
+				intf->altsetting[i].desc.bInterfaceNumber;
+			*altsetting_num =
+				intf->altsetting[i].desc.bAlternateSetting;
 			gvusb2_dbg(&intf->dev,
 				"found video at altsetting %d endpoint %d\n",
 				i, ep);
+			return true;
 		}
 	}
+
+	return false;
 }
 
 int gvusb2_vid_free(struct gvusb2_vid *dev)
@@ -421,7 +448,8 @@ int gvusb2_vid_free(struct gvusb2_vid *dev)
 	gvusb2_vid_free_urbs(dev);
 
 	/* free gvusb2 */
-	gvusb2_free(&dev->gv);
+	if (!dev->usb_resources_released)
+		gvusb2_free(&dev->gv);
 
 	/* free me */
 	kfree(dev);
@@ -434,10 +462,10 @@ void gvusb2_release(struct v4l2_device *v4l2_dev)
 	struct gvusb2_vid *dev =
 		container_of(v4l2_dev, struct gvusb2_vid, v4l2_dev);
 
+    v4l2_device_unregister(&dev->v4l2_dev);
+    v4l2_ctrl_handler_free(&dev->ctrl_handler);
+    
 	gvusb2_i2c_unregister(dev);
-
-	v4l2_ctrl_handler_free(&dev->ctrl_handler);
-	v4l2_device_unregister(&dev->v4l2_dev);
 
 	mutex_destroy(&dev->v4l2_lock);
 	mutex_destroy(&dev->vb2q_lock);
@@ -450,14 +478,16 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	struct usb_device *udev;
 	struct gvusb2_vid *dev;
 	int i, ret;
+	int interface_num = -1;
+	int altsetting_num = -1;
 	struct usb_endpoint_descriptor *video_ep = NULL;
 
 	udev = interface_to_usbdev(intf);
 
 	/* check if we're on the video interface */
 	for (i = 0; i < intf->num_altsetting; i++) {
-		gvusb2_vid_check_altsetting(intf, i, &video_ep);
-		if (video_ep != NULL)
+		if (gvusb2_vid_check_altsetting(intf, i, &video_ep,
+				&interface_num, &altsetting_num))
 			break;
 	}
 
@@ -475,20 +505,21 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (ret < 0)
 		goto free_dev;
 
-	/* XXX: No hardcoding here. */
-	ret = usb_set_interface(udev, 0, 5);
+	ret = usb_set_interface(udev, interface_num, altsetting_num);
 	if (ret < 0)
 		goto free_gvusb2;
 
 	/* initialize gvusb2_vid data */
 	dev->ep = video_ep;
 	dev->intf = intf;
+	dev->disconnected = false;
+	dev->usb_resources_released = false;
 
 	/* initialize the stk1150 in the gvusb2 */
 	gvusb2_stk1150_init(dev);
 
 	/* allocate URBs */
-	gvusb2_vid_allocate_urbs(dev);
+	ret = gvusb2_vid_allocate_urbs(dev);
 	if (ret < 0)
 		goto free_gvusb2;
 
@@ -534,13 +565,22 @@ void gvusb2_vid_disconnect(struct usb_interface *intf)
 	/* remove our data from the interface */
 	dev = usb_get_intfdata(intf);
 	usb_set_intfdata(intf, NULL);
+	if (dev == NULL)
+		return;
 
 	mutex_lock(&dev->vb2q_lock);
 	mutex_lock(&dev->v4l2_lock);
 
+	dev->disconnected = true;
+	vb2_queue_error(&dev->vb2q);
+
 	/* cancel urbs */
 	gvusb2_vid_cancel_urbs(dev);
 	gvusb2_vid_free_urbs(dev);
+	if (!dev->usb_resources_released) {
+		gvusb2_free(&dev->gv);
+		dev->usb_resources_released = true;
+	}
 
 	/* clear buffer list queue */
 	gvusb2_vid_clear_queue(dev);

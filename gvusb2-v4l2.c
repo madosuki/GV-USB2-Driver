@@ -34,21 +34,40 @@ struct i2c_regval {
 
 void get_resolution(struct gvusb2_vid *dev, int *width, int *height)
 {
-	switch (dev->standard) {
-	default:
-	case V4L2_STD_NTSC_M:
-		if (width != NULL)
-			*width = 720;
-		if (height != NULL)
-			*height = 480;
-		break;
-	case V4L2_STD_PAL_B:
-		if (width != NULL)
-			*width = 720;
+	if (width != NULL)
+		*width = 720;
+
+	if (dev->standard & V4L2_STD_625_50) {
 		if (height != NULL)
 			*height = 576;
-		break;
+	} else {
+		if (height != NULL)
+			*height = 480;
 	}
+}
+
+static void gvusb2_fill_pix_format(struct gvusb2_vid *dev,
+	struct v4l2_pix_format *pix)
+{
+	int width, height;
+
+	get_resolution(dev, &width, &height);
+
+	pix->width = width;
+	pix->height = height;
+	pix->field = V4L2_FIELD_INTERLACED;
+	pix->pixelformat = V4L2_PIX_FMT_UYVY;
+	pix->bytesperline = width * 2;
+	pix->sizeimage = height * pix->bytesperline;
+	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	pix->xfer_func = V4L2_XFER_FUNC_709;
+}
+
+static bool gvusb2_supported_std(struct gvusb2_vid *dev, v4l2_std_id std)
+{
+	return std != 0 && (std & ~dev->vdev.tvnorms) == 0;
 }
 
 void gvusb2_vid_clear_queue(struct gvusb2_vid *dev)
@@ -118,11 +137,17 @@ static void gvusb2_vb2_buf_queue(struct vb2_buffer *vb)
 	struct gvusb2_vb *gvusb2_vbuf =
 		container_of(vbuf, struct gvusb2_vb, vb);
 
+	if (dev->disconnected) {
+		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
 	spin_lock_irqsave(&dev->buf_list_lock, flags);
 
 	gvusb2_vbuf->buf_pos = 0;
 	gvusb2_vbuf->line_pos = 0;
 	gvusb2_vbuf->field = 0;
+	gvusb2_vbuf->error = false;
 	list_add_tail(&gvusb2_vbuf->list, &dev->buf_list);
 
 	spin_unlock_irqrestore(&dev->buf_list_lock, flags);
@@ -139,34 +164,69 @@ static int gvusb2_vb2_start_streaming(struct vb2_queue *vb2q,
 	if (mutex_lock_interruptible(&dev->v4l2_lock))
 		return -ERESTARTSYS;
 
+	if (dev->disconnected) {
+		ret = -ENODEV;
+		goto clear_queue;
+	}
+
 	/* set seq to 0 */
 	dev->sequence = 0;
 
 	/* set cropping */
 	reg_07 = i2c_smbus_read_byte_data(&dev->i2c_client, 0x07);
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x07, reg_07 & 0x0f);
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x08, 0x13);
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x09, 0xf4);
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x0a, 0x12);
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x0b, 0xd2);
+	if (reg_07 < 0) {
+		ret = reg_07;
+		goto clear_queue;
+	}
+
+	ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x07,
+		reg_07 & 0x0f);
+	if (ret < 0)
+		goto clear_queue;
+	ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x08, 0x13);
+	if (ret < 0)
+		goto clear_queue;
+	ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x09, 0xf4);
+	if (ret < 0)
+		goto clear_queue;
+	ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x0a, 0x12);
+	if (ret < 0)
+		goto clear_queue;
+	ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x0b, 0xd2);
+	if (ret < 0)
+		goto clear_queue;
 
 	/* start tw9910 */
 	v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 1);
 
 	/* start gvusb2 */
-	gvusb2_write_reg(&dev->gv, 0x0100, 0xb3);
+	ret = gvusb2_write_reg(&dev->gv, 0x0100, 0xb3);
+	if (ret < 0)
+		goto stop_subdev;
 	/* probably don't need to set no VBI */
-	gvusb2_write_reg(&dev->gv, 0x0103, 0x00);
+	ret = gvusb2_write_reg(&dev->gv, 0x0103, 0x00);
+	if (ret < 0)
+		goto stop_gvusb2;
 
-	/* submit urbs */
 	ret = gvusb2_vid_submit_urbs(dev);
 	if (ret < 0)
-		return ret;
+		goto stop_gvusb2;
 
-	/* stop mutex */
 	mutex_unlock(&dev->v4l2_lock);
 
 	return 0;
+
+stop_gvusb2:
+	gvusb2_write_reg(&dev->gv, 0x0100, 0x33);
+	gvusb2_write_reg(&dev->gv, 0x0103, 0x00);
+stop_subdev:
+	v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 0);
+clear_queue:
+	gvusb2_vid_clear_queue(dev);
+
+	mutex_unlock(&dev->v4l2_lock);
+
+	return ret;
 }
 
 static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
@@ -180,6 +240,9 @@ static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
 	/* cancel urbs */
 	gvusb2_vid_cancel_urbs(dev);
 
+	if (dev->disconnected)
+		goto clear_queue;
+
 	/* stop gvusb2 */
 	gvusb2_write_reg(&dev->gv, 0x0100, 0x33);
 	/* probably don't need to set no VBI */
@@ -188,6 +251,7 @@ static void gvusb2_vb2_stop_streaming(struct vb2_queue *vb2q)
 	/* stop tw9910 */
 	v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_stream, 0);
 
+clear_queue:
 	/* clear queue */
 	gvusb2_vid_clear_queue(dev);
 
@@ -200,8 +264,6 @@ static const struct vb2_ops gvusb2_vb2_ops = {
 	.buf_queue       = gvusb2_vb2_buf_queue,
 	.start_streaming = gvusb2_vb2_start_streaming,
 	.stop_streaming  = gvusb2_vb2_stop_streaming,
-	.wait_prepare    = vb2_ops_wait_prepare,
-	.wait_finish     = vb2_ops_wait_finish,
 };
 
 int gvusb2_vb2_setup(struct gvusb2_vid *dev)
@@ -224,6 +286,7 @@ int gvusb2_vb2_setup(struct gvusb2_vid *dev)
 	vb2q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 
 	INIT_LIST_HEAD(&dev->buf_list);
+	spin_lock_init(&dev->buf_list_lock);
 
 	ret = vb2_queue_init(vb2q);
 	if (ret < 0)
@@ -240,45 +303,61 @@ static int gvusb2_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct gvusb2_vid *dev = container_of(ctrl->handler,
 		struct gvusb2_vid, ctrl_handler);
+	int ret;
+
+	if (dev->disconnected)
+		return -ENODEV;
 
 	switch (ctrl->id) {
 	case V4L2_CID_BRIGHTNESS:
-		i2c_smbus_write_byte_data(&dev->i2c_client, 0x10,
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x10,
 			(ctrl->val + 0x80) & 0xff);
-		break;
+		return ret;
 	case V4L2_CID_CONTRAST:
-		i2c_smbus_write_byte_data(&dev->i2c_client, 0x11,
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x11,
 			ctrl->val);
-		break;
+		return ret;
 	case V4L2_CID_SATURATION:
-		i2c_smbus_write_byte_data(&dev->i2c_client, 0x13,
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x13,
 			ctrl->val);
-		i2c_smbus_write_byte_data(&dev->i2c_client, 0x14,
+		if (ret < 0)
+			return ret;
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x14,
 			ctrl->val);
-		break;
+		return ret;
 	case V4L2_CID_HUE:
-		i2c_smbus_write_byte_data(&dev->i2c_client, 0x15,
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x15,
 			(ctrl->val + 0x80) & 0xff);
-		break;
+		return ret;
 	case V4L2_CID_SHARPNESS:
-		i2c_smbus_write_byte_data(&dev->i2c_client, 0x12,
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client, 0x12,
 			(ctrl->val & 0x0f) | 0x50);
-		break;
+		return ret;
 	case GVUSB2_CID_VERTICAL_START:
-		gvusb2_write_reg(&dev->gv, 0x0112, ctrl->val);
-		gvusb2_write_reg(&dev->gv, 0x0113, 0);
-		gvusb2_write_reg(&dev->gv, 0x0116, ctrl->val + 0xf0);
-		gvusb2_write_reg(&dev->gv, 0x0117, 0);
-		break;
+		ret = gvusb2_write_reg(&dev->gv, 0x0112, ctrl->val);
+		if (ret < 0)
+			return ret;
+		ret = gvusb2_write_reg(&dev->gv, 0x0113, 0);
+		if (ret < 0)
+			return ret;
+		ret = gvusb2_write_reg(&dev->gv, 0x0116, ctrl->val + 0xf0);
+		if (ret < 0)
+			return ret;
+		return gvusb2_write_reg(&dev->gv, 0x0117, 0);
 	case GVUSB2_CID_HORIZONTAL_START:
-		gvusb2_write_reg(&dev->gv, 0x0110, ctrl->val);
-		gvusb2_write_reg(&dev->gv, 0x0111, 0);
-		gvusb2_write_reg(&dev->gv, 0x0114, ctrl->val + 0xa0);
-		gvusb2_write_reg(&dev->gv, 0x0115, 0x05);
-		break;
+		ret = gvusb2_write_reg(&dev->gv, 0x0110, ctrl->val);
+		if (ret < 0)
+			return ret;
+		ret = gvusb2_write_reg(&dev->gv, 0x0111, 0);
+		if (ret < 0)
+			return ret;
+		ret = gvusb2_write_reg(&dev->gv, 0x0114, ctrl->val + 0xa0);
+		if (ret < 0)
+			return ret;
+		return gvusb2_write_reg(&dev->gv, 0x0115, 0x05);
 	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static const struct v4l2_ctrl_ops gvusb2_ctrl_ops = {
@@ -318,9 +397,14 @@ static int gvusb2_vidioc_querycap(struct file *file, void *priv,
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
 
+	if (dev->disconnected)
+		return -ENODEV;
+
 	strscpy(cap->driver, "gvusb2", sizeof(cap->driver));
 	strscpy(cap->card, "gvusb2", sizeof(cap->card));
 	usb_make_path(dev->gv.udev, cap->bus_info, sizeof(cap->bus_info));
+	cap->device_caps = dev->vdev.device_caps;
+	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 
 	return 0;
 }
@@ -332,10 +416,10 @@ static int gvusb2_vidioc_enum_input(struct file *file, void *priv,
 
 	switch (i->index) {
 	case GVUSB2_INPUT_COMPOSITE:
-		strncpy(i->name, "Composite", sizeof(i->name));
+		strscpy(i->name, "Composite", sizeof(i->name));
 		break;
 	case GVUSB2_INPUT_SVIDEO:
-		strncpy(i->name, "S-Video", sizeof(i->name));
+		strscpy(i->name, "S-Video", sizeof(i->name));
 		break;
 	default:
 		return -EINVAL;
@@ -363,6 +447,9 @@ static int gvusb2_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 	u8 val;
 	s32 reg;
 
+	if (dev->disconnected)
+		return -ENODEV;
+
 	switch (i) {
 	case GVUSB2_INPUT_COMPOSITE:
 		/* set Composite and Mux 0 */
@@ -380,7 +467,8 @@ static int gvusb2_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 	if (reg < 0)
 		return reg;
 
-	i2c_smbus_write_byte_data(&dev->i2c_client, 0x02, (reg & 0xc3) | val);
+	reg = i2c_smbus_write_byte_data(&dev->i2c_client, 0x02,
+		(reg & 0xc3) | val);
 	if (reg < 0)
 		return reg;
 
@@ -414,13 +502,18 @@ static int gvusb2_vidioc_s_std(struct file *file, void *priv, v4l2_std_id std)
 	struct gvusb2_vid *dev = video_drvdata(file);
 	struct vb2_queue *vb2q = &dev->vb2q;
 
+	if (dev->disconnected)
+		return -ENODEV;
+
 	if (std == dev->standard)
 		return 0;
+
+	if (!gvusb2_supported_std(dev, std))
+		return -EINVAL;
 
 	if (vb2_is_busy(vb2q))
 		return -EBUSY;
 
-	/* TODO: set standard based off of this */
 	dev->standard = std;
 	v4l2_device_call_all(&dev->v4l2_dev, 0, video, s_std, std);
 
@@ -442,16 +535,8 @@ static int gvusb2_vidioc_g_fmt_vid_cap(struct file *file, void *priv,
 	struct v4l2_format *f)
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
-	int width, height;
 
-	get_resolution(dev, &width, &height);
-	f->fmt.pix.width = width;
-	f->fmt.pix.height = height;
-	f->fmt.pix.field = V4L2_FIELD_INTERLACED;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
-	f->fmt.pix.bytesperline = width * 2;
-	f->fmt.pix.sizeimage = height * width * 2;
-	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
+	gvusb2_fill_pix_format(dev, &f->fmt.pix);
 
 	return 0;
 }
@@ -461,19 +546,14 @@ static int gvusb2_vidioc_s_fmt_vid_cap(struct file *file, void *priv,
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
 	struct vb2_queue *vb2q = &dev->vb2q;
-	int width, height;
+
+	if (dev->disconnected)
+		return -ENODEV;
 
 	if (vb2_is_busy(vb2q))
 		return -EBUSY;
 
-	get_resolution(dev, &width, &height);
-	f->fmt.pix.width = width;
-	f->fmt.pix.height = height;
-	f->fmt.pix.field = V4L2_FIELD_INTERLACED;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
-	f->fmt.pix.bytesperline = width * 2;
-	f->fmt.pix.sizeimage = height * width * 2;
-	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
+	gvusb2_fill_pix_format(dev, &f->fmt.pix);
 
 	return 0;
 }
@@ -482,18 +562,55 @@ static int gvusb2_vidioc_try_fmt_vid_cap(struct file *file, void *priv,
 	struct v4l2_format *f)
 {
 	struct gvusb2_vid *dev = video_drvdata(file);
-	int width, height;
 
-	get_resolution(dev, &width, &height);
-	f->fmt.pix.width = width;
-	f->fmt.pix.height = height;
-	f->fmt.pix.field = V4L2_FIELD_INTERLACED;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
-	f->fmt.pix.bytesperline = width * 2;
-	f->fmt.pix.sizeimage = height * width * 2;
-	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
+	gvusb2_fill_pix_format(dev, &f->fmt.pix);
 
 	return 0;
+}
+
+static int gvusb2_vidioc_enum_framesizes(struct file *file, void *priv,
+	struct v4l2_frmsizeenum *fsize)
+{
+	if (fsize->pixel_format != V4L2_PIX_FMT_UYVY)
+		return -EINVAL;
+
+	switch (fsize->index) {
+	case 0:
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = 720;
+		fsize->discrete.height = 480;
+		return 0;
+	case 1:
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = 720;
+		fsize->discrete.height = 576;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int gvusb2_vidioc_enum_frameintervals(struct file *file, void *priv,
+	struct v4l2_frmivalenum *fival)
+{
+	if (fival->pixel_format != V4L2_PIX_FMT_UYVY || fival->width != 720 ||
+	    fival->index != 0)
+		return -EINVAL;
+
+	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+
+	switch (fival->height) {
+	case 480:
+		fival->discrete.numerator = 1001;
+		fival->discrete.denominator = 30000;
+		return 0;
+	case 576:
+		fival->discrete.numerator = 1;
+		fival->discrete.denominator = 25;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static const struct v4l2_ioctl_ops gvusb2_v4l2_ioctl_ops = {
@@ -508,6 +625,8 @@ static const struct v4l2_ioctl_ops gvusb2_v4l2_ioctl_ops = {
 	.vidioc_g_fmt_vid_cap     = gvusb2_vidioc_g_fmt_vid_cap,
 	.vidioc_s_fmt_vid_cap     = gvusb2_vidioc_s_fmt_vid_cap,
 	.vidioc_try_fmt_vid_cap   = gvusb2_vidioc_try_fmt_vid_cap,
+	.vidioc_enum_framesizes   = gvusb2_vidioc_enum_framesizes,
+	.vidioc_enum_frameintervals = gvusb2_vidioc_enum_frameintervals,
 
 	.vidioc_reqbufs           = vb2_ioctl_reqbufs,
 	.vidioc_querybuf          = vb2_ioctl_querybuf,
@@ -564,7 +683,7 @@ int gvusb2_v4l2_register(struct gvusb2_vid *dev)
 	mutex_init(&dev->v4l2_lock);
 
 	/* make our ctrl handler */
-	ret = v4l2_ctrl_handler_init(&dev->ctrl_handler, 5);
+	ret = v4l2_ctrl_handler_init(&dev->ctrl_handler, 7);
 	if (ret < 0)
 		return ret;
 
@@ -600,18 +719,29 @@ int gvusb2_v4l2_register(struct gvusb2_vid *dev)
 	/* load tw9910 driver */
 	dev->sd_tw9910 = v4l2_i2c_new_subdev_board(&dev->v4l2_dev, &dev->adap,
 		&gvusb2_tw9910_i2c_board_info, 0);
+	if (dev->sd_tw9910 == NULL) {
+		ret = -ENODEV;
+		goto unregister_v4l2;
+	}
 
 	/* init tw9910 */
-	for (i = 0; phase6[i].reg != 0xff; i++)
-		i2c_smbus_write_byte_data(&dev->i2c_client,
+	for (i = 0; phase6[i].reg != 0xff; i++) {
+		ret = i2c_smbus_write_byte_data(&dev->i2c_client,
 			phase6[i].reg, phase6[i].val);
+		if (ret < 0)
+			goto unregister_v4l2;
+	}
 
 	/* set STK1150 to always double word */
 	/* not quite sure the importance */
-	gvusb2_set_reg_mask(&dev->gv, 0x05f0, 0x08, 0x08);
+	ret = gvusb2_set_reg_mask(&dev->gv, 0x05f0, 0x08, 0x08);
+	if (ret < 0)
+		goto unregister_v4l2;
 
 	return 0;
 
+unregister_v4l2:
+	v4l2_device_unregister(&dev->v4l2_dev);
 free_ctrl_handler:
 	v4l2_ctrl_handler_free(&dev->ctrl_handler);
 

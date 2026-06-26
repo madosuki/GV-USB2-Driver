@@ -35,6 +35,7 @@ struct gvusb2_vb {
 	int buf_pos;
 	int line_pos;
 	int field;
+	bool error;
 };
 
 struct gvusb2_vid {
@@ -47,6 +48,8 @@ struct gvusb2_vid {
 	struct urb *urbs[GVUSB2_NUM_URBS];
 	/* keeps track of packet seq */
 	unsigned char counter;
+	bool disconnected;
+	bool usb_resources_released;
 
 	/* i2c data */
 	struct i2c_adapter adap;

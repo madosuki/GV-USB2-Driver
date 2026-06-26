@@ -19,14 +19,19 @@
 
 static int gvusb2_i2c_busy_wait(struct gvusb2_vid *dev, u8 wait_mask)
 {
-	int attempts;
+	int attempts, ret;
 	u8 flag;
 
 	attempts = 0;
 	while (attempts < 100) {
-		gvusb2_read_reg(&dev->gv, 0x0201, &flag);
+		ret = gvusb2_read_reg(&dev->gv, 0x0201, &flag);
+		if (ret < 0)
+			return ret;
 		if (flag & wait_mask)
 			return 0;
+
+		attempts++;
+		usleep_range(1000, 2000);
 	}
 
 	return -ETIMEDOUT;
