@@ -56,6 +56,7 @@ struct gvusb2_snd {
 	bool running;
 	bool disconnected;
 	bool release_on_card_free;
+	bool usb_resources_released;
 	bool isoc_resources_released;
 	spinlock_t lock;
 };
@@ -225,7 +226,7 @@ static int gvusb2_snd_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		spin_lock_irqsave(&dev->lock, flags);
-		if (dev->disconnected || dev->gv.udev == NULL) {
+		if (dev->disconnected || dev->usb_resources_released) {
 			spin_unlock_irqrestore(&dev->lock, flags);
 			return -ENODEV;
 		}
@@ -287,6 +288,10 @@ static int gvusb2_snd_dev_free(struct snd_device *device)
 	if (!dev->isoc_resources_released)
 		gvusb2_snd_free_isoc(dev);
 
+	if (!dev->usb_resources_released) {
+		gvusb2_free(&dev->gv);
+		dev->usb_resources_released = true;
+	}
 	kfree(dev);
 
 	return 0;
@@ -326,15 +331,11 @@ int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 	dev->running = false;
 	dev->disconnected = false;
 	dev->release_on_card_free = false;
+	dev->usb_resources_released = false;
 	dev->isoc_resources_released = false;
 
-	/*
-	 * The card can outlive USB disconnect while userspace still has the PCM
-	 * open. Do not parent it to the USB interface, otherwise the ALSA device
-	 * keeps the unplugged USB device model object referenced.
-	 */
-	ret = snd_card_new(NULL, index[crdIdx], ids[crdIdx], THIS_MODULE, 0,
-		&dev->card);
+	ret = snd_card_new(&dev->intf->dev, index[crdIdx], ids[crdIdx], THIS_MODULE, 0,
+			&dev->card);
 	if (ret < 0)
 		return ret;
 
@@ -381,11 +382,14 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 {
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
+	bool release_usb_resources;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	dev->disconnected = true;
 	dev->running = false;
 	substream = dev->substream;
+	release_usb_resources = !dev->usb_resources_released;
+	dev->usb_resources_released = true;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	snd_card_disconnect(dev->card);
@@ -399,8 +403,9 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 	}
 
 	gvusb2_snd_cancel_isoc(dev);
-	gvusb2_snd_free_isoc(dev);
-	dev->gv.udev = NULL;
+	if (release_usb_resources) {
+		gvusb2_free(&dev->gv);
+	}
 	snd_card_free_when_closed(dev->card);
 }
 
@@ -506,7 +511,8 @@ static void gvusb2_snd_isoc_irq(struct urb *urb)
 	gvusb2_snd_process_isoc(dev, urb);
 
 	spin_lock_irqsave(&dev->lock, flags);
-	running = dev->running && !dev->disconnected && dev->gv.udev != NULL;
+	running = dev->running && !dev->disconnected &&
+		!dev->usb_resources_released;
 	spin_unlock_irqrestore(&dev->lock, flags);
 	if (!running)
 		return;
@@ -525,7 +531,7 @@ static int gvusb2_snd_submit_isoc(struct gvusb2_snd *dev, gfp_t mem_flags)
 {
 	int i, ret;
 
-	if (dev->disconnected || dev->gv.udev == NULL)
+	if (dev->disconnected || dev->usb_resources_released)
 		return -ENODEV;
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
@@ -647,22 +653,19 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	if (dev == NULL)
 		return -ENOMEM;
 
-	/*
-	 * Mirror stk1160: borrow usbcore's device pointer while this interface
-	 * is bound. ALSA can outlive disconnect, so disconnect clears this
-	 * pointer after killing/freeing isoc URBs instead of holding an extra
-	 * usb_get_dev() reference.
-	 */
-	dev->gv.udev = udev;
+	/* initialize gvusb2 core stuff */
+	ret = gvusb2_init(&dev->gv, udev);
+	if (ret < 0)
+		goto free_dev;
 
 	ret = usb_set_interface(udev, interface_num, altsetting_num);
 	if (ret < 0)
-		goto free_dev;
+		goto free_gvusb2;
 
 	/* reset the adc */
 	ret = gvusb2_snd_reset_adc(&dev->gv);
 	if (ret < 0)
-		goto free_dev;
+		goto free_gvusb2;
 
 	/* initialize gvusb2_snd data */
 	dev->ep = audio_ep;
@@ -671,7 +674,7 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	/* initialize sound stuff */
 	ret = gvusb2_snd_alsa_init(dev);
 	if (ret < 0)
-		goto free_dev;
+		goto free_gvusb2;
 
 	/* allocate URBs */
 	ret = gvusb2_snd_allocate_urbs(dev);
@@ -687,6 +690,8 @@ free_alsa:
 	gvusb2_snd_alsa_free(dev);
 	return ret;
 
+free_gvusb2:
+	gvusb2_free(&dev->gv);
 free_dev:
 	kfree(dev);
 	return ret;
