@@ -23,12 +23,22 @@
 
 #define CARD_NAME "gvusb2"
 
+MODULE_DESCRIPTION("gvusb2 sound driver");
+MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
+MODULE_LICENSE("Dual BSD/GPL");
+
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *ids[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enabled[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
+
+static const struct usb_device_id gvusb2_id_table[] = {
+	{ USB_DEVICE(GVUSB2_VENDOR_ID, GVUSB2_PRODUCT_ID) },
+	{ }
+};
+MODULE_DEVICE_TABLE(usb, gvusb2_id_table);
+
 struct gvusb2_snd {
-	enum gvusb2_interface_type type;
 	struct gvusb2_dev gv;
 	struct usb_interface *intf;
 	struct usb_endpoint_descriptor *ep;
@@ -79,7 +89,7 @@ static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev);
  *  Alsa Stuff
  ****************************************************************************/
 
-static void gvusb2_snd_process_pcm(
+void gvusb2_snd_process_pcm(
 	struct gvusb2_snd *dev,
 	struct snd_pcm_substream *substream,
 	unsigned char *buf,
@@ -303,7 +313,7 @@ static const struct snd_pcm_ops gvusb2_snd_capture_ops = {
 	.page      = gvusb2_snd_pcm_page,
 };
 
-static int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
+int gvusb2_snd_alsa_init(struct gvusb2_snd *dev)
 {
 	int ret;
 	int crdIdx = 0;
@@ -372,11 +382,14 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 {
 	struct snd_pcm_substream *substream;
 	unsigned long flags;
+	bool release_usb_resources;
 
 	spin_lock_irqsave(&dev->lock, flags);
 	dev->disconnected = true;
 	dev->running = false;
 	substream = dev->substream;
+	release_usb_resources = !dev->usb_resources_released;
+	dev->usb_resources_released = true;
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	snd_card_disconnect(dev->card);
@@ -390,6 +403,9 @@ static void gvusb2_snd_alsa_disconnect(struct gvusb2_snd *dev)
 	}
 
 	gvusb2_snd_cancel_isoc(dev);
+	if (release_usb_resources) {
+		gvusb2_free(&dev->gv);
+	}
 	snd_card_free_when_closed(dev->card);
 }
 
@@ -443,7 +459,7 @@ static void gvusb2_snd_free_isoc(struct gvusb2_snd *dev)
 	dev->isoc_resources_released = true;
 }
 
-static void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)
+void gvusb2_snd_process_isoc(struct gvusb2_snd *dev, struct urb *urb)
 {
 	int i;
 	unsigned char *buf_iter;
@@ -654,7 +670,6 @@ int gvusb2_snd_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	/* initialize gvusb2_snd data */
 	dev->ep = audio_ep;
 	dev->intf = intf;
-	dev->type = GVUSB2_INTF_SOUND;
 
 	/* initialize sound stuff */
 	ret = gvusb2_snd_alsa_init(dev);
@@ -695,3 +710,12 @@ void gvusb2_snd_disconnect(struct usb_interface *intf)
 
 	gvusb2_snd_alsa_disconnect(dev);
 }
+
+static struct usb_driver gvusb2_snd_usb_driver = {
+	.name = "gvusb2-snd",
+	.probe = gvusb2_snd_probe,
+	.disconnect = gvusb2_snd_disconnect,
+	.id_table = gvusb2_id_table,
+};
+
+module_usb_driver(gvusb2_snd_usb_driver);

@@ -17,6 +17,17 @@
 
 #include "gvusb2-vid.h"
 
+MODULE_DESCRIPTION("gvusb2 video driver");
+MODULE_AUTHOR("Isaac Lozano <109lozanoi@gmail.com>");
+MODULE_LICENSE("Dual BSD/GPL");
+MODULE_SOFTDEP("pre: usbtv");
+
+static const struct usb_device_id gvusb2_id_table[] = {
+	{ USB_DEVICE(GVUSB2_VENDOR_ID, GVUSB2_PRODUCT_ID) },
+	{ }
+};
+MODULE_DEVICE_TABLE(usb, gvusb2_id_table);
+
 /*****************************************************************************
  * Data Processing Functions
  ****************************************************************************/
@@ -226,7 +237,7 @@ static void gvusb2_vid_isoc_irq(struct urb *urb)
  * USB functions
  ****************************************************************************/
 
-static void gvusb2_vid_free_urbs(struct gvusb2_vid *dev)
+void gvusb2_vid_free_urbs(struct gvusb2_vid *dev)
 {
 	int i;
 
@@ -242,7 +253,7 @@ static void gvusb2_vid_free_urbs(struct gvusb2_vid *dev)
 	}
 }
 
-static int gvusb2_vid_allocate_urbs(struct gvusb2_vid *dev)
+int gvusb2_vid_allocate_urbs(struct gvusb2_vid *dev)
 {
 	int i;
 
@@ -293,7 +304,7 @@ int gvusb2_vid_submit_urbs(struct gvusb2_vid *dev)
 	int i;
 	int ret;
 
-	if (READ_ONCE(dev->disconnected))
+	if (dev->disconnected)
 		return -ENODEV;
 
 	for (i = 0; i < GVUSB2_NUM_URBS; i++) {
@@ -431,7 +442,7 @@ static bool gvusb2_vid_check_altsetting(struct usb_interface *intf, int i,
 	return false;
 }
 
-static int gvusb2_vid_free(struct gvusb2_vid *dev)
+int gvusb2_vid_free(struct gvusb2_vid *dev)
 {
 	/* free urbs */
 	gvusb2_vid_free_urbs(dev);
@@ -501,8 +512,7 @@ int gvusb2_vid_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	/* initialize gvusb2_vid data */
 	dev->ep = video_ep;
 	dev->intf = intf;
-	dev->type = GVUSB2_INTF_VIDEO;
-	WRITE_ONCE(dev->disconnected, false);
+	dev->disconnected = false;
 	dev->usb_resources_released = false;
 
 	/* initialize the stk1150 in the gvusb2 */
@@ -560,14 +570,17 @@ void gvusb2_vid_disconnect(struct usb_interface *intf)
 
 	mutex_lock(&dev->vb2q_lock);
 	mutex_lock(&dev->v4l2_lock);
-	WRITE_ONCE(dev->disconnected, true);
+
+	dev->disconnected = true;
 	vb2_queue_error(&dev->vb2q);
-	mutex_unlock(&dev->v4l2_lock);
-	mutex_unlock(&dev->vb2q_lock);
 
 	/* cancel urbs */
 	gvusb2_vid_cancel_urbs(dev);
 	gvusb2_vid_free_urbs(dev);
+	if (!dev->usb_resources_released) {
+		gvusb2_free(&dev->gv);
+		dev->usb_resources_released = true;
+	}
 
 	/* clear buffer list queue */
 	gvusb2_vid_clear_queue(dev);
@@ -576,6 +589,20 @@ void gvusb2_vid_disconnect(struct usb_interface *intf)
 	video_unregister_device(&dev->vdev);
 	v4l2_device_disconnect(&dev->v4l2_dev);
 
+	/* make udev NULL? */
+
+	mutex_unlock(&dev->v4l2_lock);
+	mutex_unlock(&dev->vb2q_lock);
+
 	/* decrease v4l2 refcount */
 	v4l2_device_put(&dev->v4l2_dev);
 }
+
+static struct usb_driver gvusb2_vid_usb_driver = {
+	.name = "gvusb2-vid",
+	.probe = gvusb2_vid_probe,
+	.disconnect = gvusb2_vid_disconnect,
+	.id_table = gvusb2_id_table,
+};
+
+module_usb_driver(gvusb2_vid_usb_driver);

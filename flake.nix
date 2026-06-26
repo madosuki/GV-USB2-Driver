@@ -53,8 +53,10 @@
 
           installPhase = ''
             runHook preInstall
-            install -D -m 0644 gvusb2.ko \
-              $out/lib/modules/${kernel.modDirVersion}/extra/gvusb2.ko
+            install -D -m 0644 gvusb2-sound.ko \
+              $out/lib/modules/${kernel.modDirVersion}/extra/gvusb2-sound.ko
+            install -D -m 0644 gvusb2-video.ko \
+              $out/lib/modules/${kernel.modDirVersion}/extra/gvusb2-video.ko
             runHook postInstall
           '';
 
@@ -63,7 +65,7 @@
           };
 
           meta = {
-            description = "IO-DATA GV-USB2 capture device Linux kernel module";
+            description = "IO-DATA GV-USB2 capture device Linux kernel modules";
             license = with lib.licenses; [
               gpl2Only
               bsd3
